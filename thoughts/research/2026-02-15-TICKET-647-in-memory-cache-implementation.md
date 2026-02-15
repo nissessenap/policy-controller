@@ -9,6 +9,7 @@ tags: [research, codebase, caching, performance, webhook, cosign, registry]
 status: complete
 last_updated: "2026-02-15"
 last_updated_by: claude
+last_updated_note: "Resolved open questions: ref.String() chosen over ref.Name(), errors will not be cached, scope decisions finalized"
 ---
 
 # Research: In-Memory Cache Implementation for Policy-Controller
@@ -72,7 +73,7 @@ The cache key is composed of:
 
 This means cache invalidation happens automatically when a policy is modified (new ResourceVersion).
 
-**Note**: There is a subtle inconsistency - `Set` uses `ref.Name()` while `Get` uses `ref.String()`. This would need to be harmonized in any real implementation.
+**Bug (must fix)**: `Set` uses `ref.Name()` while `Get` uses `ref.String()`. For digest references with a tag (the standard format in policy-controller, since the mutating webhook resolves all tags to `repo:tag@sha256:...`), `ref.Name()` preserves the tag while `ref.String()` drops it. This means the cache would never hit. **Resolution**: Use `ref.String()` everywhere. The digest uniquely identifies the image content and is what signatures are attached to - the tag is irrelevant for verification. Using `ref.String()` also gives better cache hit rates since different tags pointing to the same digest share a cache entry. Fix: change `ref.Name()` to `ref.String()` at `validator.go:422`.
 
 ### 2. What Gets Called Externally (What the Cache Would Avoid)
 
@@ -209,6 +210,8 @@ func(ctx context.Context) context.Context {
 }
 ```
 
+**Error handling**: Do not cache errors. If `cacheResult.Errors` is non-empty, skip caching. This avoids the scenario where someone signs an image but the webhook keeps returning a stale "not signed" error from cache. Matches Kyverno's approach.
+
 **Pros**:
 - Smallest change, lowest risk
 - Uses the existing architecture exactly as designed
@@ -217,25 +220,13 @@ func(ctx context.Context) context.Context {
 
 **Cons**:
 - Doesn't cache across policy changes (new ResourceVersion = cache miss)
-- Cache key inconsistency between Set (ref.Name()) and Get (ref.String()) needs fixing first
+- Requires one-line fix for ref.Name() -> ref.String() at validator.go:422
 
-### Option B: TTL Cache with Separate Success/Failure TTLs
+### ~~Option B: TTL Cache with Separate Success/Failure TTLs~~ (Eliminated)
 
-Same as Option A but with separate TTLs for successful and failed validations.
+~~Same as Option A but with separate TTLs for successful and failed validations.~~
 
-**Additional flags**:
-```
---cache-ttl-success (duration, default: 1h)
---cache-ttl-failure (duration, default: 5m)
-```
-
-**Pros**:
-- More control over error caching behavior
-- Follows Kyverno's pattern (they don't cache failures at all)
-
-**Cons**:
-- Slightly more complex
-- `hashicorp/golang-lru/v2/expirable` doesn't support per-item TTL out of the box (would need `jellydator/ttlcache/v3` or custom wrapper)
+**Decision**: Eliminated. Errors will not be cached at all (see Option A). Caching errors risks confusing users who are actively signing images and expecting the webhook to pick up the new signature immediately. There is no need for a failure TTL if failures are never cached.
 
 ### Option C: Image-Level Cache (Policy-Version-Independent)
 
@@ -284,13 +275,27 @@ Store cached results in Kubernetes (e.g., in TrustRoot Status or a dedicated Con
 
 ## Recommendation
 
-**Start with Option A** (implement the existing interface). It's the smallest change, uses the architecture the maintainers designed, and addresses the core issue. The existing `ResultCache` interface and the `Set`/`Get` call sites in `validator.go` are already wired up - the only missing piece is an actual cache implementation and injecting it into the context.
+**Implement Option A** (implement the existing interface). It's the smallest change, uses the architecture the maintainers designed, and addresses the core issue. The existing `ResultCache` interface and the `Set`/`Get` call sites in `validator.go` are already wired up - the only missing piece is an actual cache implementation and injecting it into the context.
 
 Use `hashicorp/golang-lru/v2/expirable` since PR #1825 is already introducing this dependency. This keeps the project consistent.
 
-**Fix the ref.Name() vs ref.String() inconsistency** in the Set/Get calls before implementing the cache, or the cache will never hit.
+### Decisions Made
 
-After Option A is proven, consider evolving to Option B (separate TTLs) or Option D (multi-layer) based on observed cache hit rates.
+- **Cache library**: `hashicorp/golang-lru/v2/expirable`
+- **Cache key fix**: Change `ref.Name()` to `ref.String()` at `validator.go:422` (one-line fix)
+- **Error caching**: Do not cache errors at all - return early in `Set` if errors are present
+- **Scope**: Validating webhook only (issue #647 scope). Mutating webhook caching is a separate concern.
+- **Cache scope**: Global (shared across admission requests), injected at controller startup via context
+- **Metrics**: Desirable but deferred. The policy-controller has zero custom Prometheus metrics today - adding cache metrics would be the first custom metrics implementation and is better as a follow-up.
+- **Helm chart**: Flag exposure in `sigstore/helm-charts` is a separate follow-up after this is merged.
+
+### Changes Required
+
+1. **New file** `pkg/webhook/lrucache.go` (~50-80 lines) - `ResultCache` implementation using `hashicorp/golang-lru/v2/expirable`, skipping error caching
+2. **New file** `pkg/webhook/lrucache_test.go` - Tests for the cache implementation
+3. **`cmd/webhook/main.go`** - Add flags (`--enable-cache`, `--cache-size`, `--cache-ttl`) and inject cache via `cwebhook.ToContext(ctx, cache)` in context enrichment functions (~15-20 lines)
+4. **`pkg/webhook/validator.go:422`** - One-line fix: `ref.Name()` -> `ref.String()`
+5. **`go.mod`** - Add `hashicorp/golang-lru/v2` (if PR #1825 hasn't merged yet)
 
 ## Code References
 
@@ -355,16 +360,16 @@ Admission Request
 - [maypok86/otter](https://github.com/maypok86/otter)
 - [Kubernetes Admission Webhook Best Practices](https://kubernetes.io/docs/concepts/cluster-administration/admission-webhooks-good-practices/)
 
-## Open Questions
+## Resolved Questions
 
-1. **Should errors be cached?** Kyverno deliberately does NOT cache failures. The existing `CacheResult` type supports caching errors, but transient errors (network issues, auth failures) should not be cached. A separate TTL for errors (Option B) or skipping error caching entirely would be reasonable.
+1. **Should errors be cached?** **No.** Errors will not be cached. Caching errors risks confusing users who are actively signing images and expecting the webhook to pick up the new signature immediately. The `Set` method will return early if `cacheResult.Errors` is non-empty. This matches Kyverno's approach.
 
-2. **ref.Name() vs ref.String() inconsistency** - The Set call uses `ref.Name()` but Get uses `ref.String()`. Which is correct? This must be harmonized before any cache implementation will work.
+2. **ref.Name() vs ref.String() inconsistency** - **Use `ref.String()`.** The digest uniquely identifies image content and is what signatures are attached to. The tag is irrelevant for verification. `ref.String()` also gives better cache hit rates since different tags pointing to the same digest share a cache entry. This is especially important because the mutating webhook resolves all tags to `repo:tag@sha256:...` format, making the combined format the standard case.
 
-3. **Should the mutating webhook also use the cache?** Currently only the validating webhook context enrichment adds validators. The mutating webhook does tag-to-digest resolution which could also benefit from caching.
+3. **Should the mutating webhook also use the cache?** **No, not in this scope.** This implementation focuses on the validating webhook only, matching the scope of issue #647. Mutating webhook caching (e.g., for tag-to-digest resolution) is a separate concern.
 
-4. **Cache scope per request vs global** - Should the cache be per-admission-request or global across requests? The existing interface is global (stored in context at controller startup), which is the right approach for reducing registry calls across different admission requests for the same image.
+4. **Cache scope per request vs global** - **Global.** The cache is shared across admission requests, injected at controller startup via context. This is the right approach for reducing registry calls across different admission requests for the same image.
 
-5. **Metrics** - Should cache hit/miss metrics be exposed via Prometheus? This would help operators tune cache size and TTL. Kyverno and Gatekeeper both expose cache metrics.
+5. **Metrics** - **Deferred.** The policy-controller has zero custom Prometheus metrics today (no counters, histograms, or gauges in `pkg/` or `cmd/`). Adding cache metrics would be the first custom metrics implementation and is better done as a separate follow-up.
 
-6. **Helm chart integration** - The new flags (`--enable-cache`, `--cache-size`, `--cache-ttl`) need to be exposed in the Helm chart at `https://github.com/sigstore/helm-charts`.
+6. **Helm chart integration** - **Deferred.** The new flags need to be exposed in `sigstore/helm-charts` but that is a separate PR after this implementation is merged.
