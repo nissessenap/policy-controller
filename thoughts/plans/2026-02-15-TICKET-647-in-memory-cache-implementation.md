@@ -227,6 +227,7 @@ func TestLRUCacheResourceVersionInvalidation(t *testing.T) {
 Tests to write:
 - `TestValidatePolicyCacheHit` - Second call to ValidatePolicy returns cached result without calling cosign
 - `TestValidatePolicyCacheSkipsErrors` - Failed validation is NOT cached, second call invokes cosign again
+- `TestValidatePolicyNoCacheDefault` - When no cache is injected (default), every call invokes cosign (NoCache fallback)
 
 ```go
 func TestValidatePolicyCacheHit(t *testing.T) {
@@ -340,6 +341,61 @@ func TestValidatePolicyCacheSkipsErrors(t *testing.T) {
 	}
 	if callCount != 2 {
 		t.Fatalf("expected cosign to be called again (errors not cached), got %d calls", callCount)
+	}
+}
+
+func TestValidatePolicyNoCacheDefault(t *testing.T) {
+	origCVS := cosignVerifySignatures
+	defer func() { cosignVerifySignatures = origCVS }()
+
+	callCount := 0
+	cosignVerifySignatures = func(_ context.Context, _ name.Reference, _ *cosign.CheckOpts) ([]oci.Signature, bool, error) {
+		callCount++
+		sig, err := static.NewSignature(nil, "")
+		if err != nil {
+			return nil, false, err
+		}
+		return []oci.Signature{sig}, true, nil
+	}
+
+	ctx, _ := rtesting.SetupFakeContext(t)
+	kc, err := k8schain.NewNoClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Do NOT inject a cache - this is the default behavior
+	// FromContext(ctx) should return NoCache
+
+	cip := webhookcip.ClusterImagePolicy{
+		Authorities: []webhookcip.Authority{{
+			Key: &webhookcip.KeyRef{
+				Data:              authorityKeyCosignPubString,
+				PublicKeys:        []crypto.PublicKey{authorityKeyCosignPub},
+				HashAlgorithm:     signaturealgo.DefaultSignatureAlgorithm,
+				HashAlgorithmCode: crypto.SHA256,
+			},
+		}},
+	}
+	cip.UID = "test-uid"
+	cip.ResourceVersion = "v1"
+
+	// First call
+	_, errs1 := ValidatePolicy(ctx, system.Namespace(), digest, cip, kc)
+	if len(errs1) > 0 {
+		t.Fatalf("unexpected errors: %v", errs1)
+	}
+	if callCount != 1 {
+		t.Fatalf("expected cosign called once, got %d", callCount)
+	}
+
+	// Second call - should call cosign again because there is no cache
+	_, errs2 := ValidatePolicy(ctx, system.Namespace(), digest, cip, kc)
+	if len(errs2) > 0 {
+		t.Fatalf("unexpected errors: %v", errs2)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected cosign called twice (no cache), got %d calls", callCount)
 	}
 }
 ```
@@ -515,6 +571,7 @@ func NewValidatingAdmissionController(ctx context.Context, cmw configmap.Watcher
 ### Integration Tests (`pkg/webhook/validator_test.go`):
 - `ValidatePolicy` cache hit: second call returns cached result, cosign not invoked again
 - `ValidatePolicy` error bypass: failed validation not cached, cosign invoked on retry
+- `ValidatePolicy` no cache default: when no cache is injected, every call invokes cosign (NoCache fallback, backwards compatibility)
 
 ### Existing E2E Tests:
 - Bash-based scripts in `test/` - should continue to pass unchanged since cache defaults to disabled
