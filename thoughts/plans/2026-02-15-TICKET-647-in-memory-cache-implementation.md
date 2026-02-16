@@ -25,7 +25,7 @@ Implement the existing `ResultCache` interface (`pkg/webhook/cache.go`) with an 
 - Cache is opt-in via `--enable-cache` flag (default: false)
 - Cache size configurable via `--cache-size` (default: 1024)
 - Cache TTL configurable via `--cache-ttl` (default: 1h)
-- Errors are never cached (only successful validations)
+- Failed validations are never cached (only results where PolicyResult is non-nil)
 - Cache is injected into the validating webhook context only
 - Unit tests for cache implementation + integration tests for cache usage in ValidatePolicy
 - The `ref.Name()` -> `ref.String()` bug fix is included
@@ -46,7 +46,7 @@ go test $(go list ./... | grep -v third_party/)
 - Helm chart flag exposure (separate repo: sigstore/helm-charts)
 - Multi-layer caching (digest resolution, signature verification layers)
 - Persistent/shared cache across replicas (K8s API-backed)
-- Caching errors (transient by nature, confuses users signing images)
+- Caching failed validations (PolicyResult == nil; transient by nature, confuses users signing images)
 
 ## Implementation Approach
 
@@ -67,7 +67,8 @@ Write all tests first. They will fail because the `LRUCache` type doesn't exist 
 Tests to write:
 - `TestLRUCacheSetGet` - Basic set and get, verify cache hit returns correct result
 - `TestLRUCacheMiss` - Get on empty cache returns nil
-- `TestLRUCacheSkipsErrors` - Set with non-empty errors is a no-op, subsequent Get returns nil
+- `TestLRUCacheSkipsErrors` - Set with nil PolicyResult (failed validation) is a no-op, subsequent Get returns nil
+- `TestLRUCachePartialSuccess` - Set with non-nil PolicyResult AND non-empty Errors (some authorities passed, some failed) IS cached
 - `TestLRUCacheTTLExpiry` - Set with short TTL, sleep, verify Get returns nil
 - `TestLRUCacheEviction` - Set more entries than cache size, verify oldest are evicted
 - `TestLRUCacheKeyIsolation` - Different image/uid/resourceVersion combinations don't collide
@@ -117,13 +118,43 @@ func TestLRUCacheSkipsErrors(t *testing.T) {
 	cache := NewLRUCache(10, 1*time.Hour)
 	ctx := context.Background()
 
+	// Failed validation: PolicyResult is nil, only errors present.
+	// This is the case when no authorities matched (validator.go:590-591).
 	cache.Set(ctx, "gcr.io/foo/bar@sha256:abc", "my-policy", "uid-1", "v1", &CacheResult{
 		Errors: []error{errors.New("image not signed")},
 	})
 
 	got := cache.Get(ctx, "gcr.io/foo/bar@sha256:abc", "uid-1", "v1")
 	if got != nil {
-		t.Fatalf("expected cache miss for error result, got %v", got)
+		t.Fatalf("expected cache miss for failed validation, got %v", got)
+	}
+}
+
+func TestLRUCachePartialSuccess(t *testing.T) {
+	cache := NewLRUCache(10, 1*time.Hour)
+	ctx := context.Background()
+
+	// Partial success: PolicyResult is non-nil (at least one authority matched)
+	// but there are also errors from authorities that didn't match.
+	// This is the common case with multi-authority CIPs (validator.go:641).
+	cache.Set(ctx, "gcr.io/foo/bar@sha256:abc", "my-policy", "uid-1", "v1", &CacheResult{
+		PolicyResult: &PolicyResult{
+			AuthorityMatches: map[string]AuthorityMatch{
+				"authority-0": {Static: true},
+			},
+		},
+		Errors: []error{errors.New("authority-1: signature invalid")},
+	})
+
+	got := cache.Get(ctx, "gcr.io/foo/bar@sha256:abc", "uid-1", "v1")
+	if got == nil {
+		t.Fatal("expected cache hit for partial success (PolicyResult non-nil), got nil")
+	}
+	if got.PolicyResult == nil {
+		t.Fatal("expected PolicyResult in cached result")
+	}
+	if len(got.Errors) != 1 {
+		t.Fatalf("expected 1 error in cached result, got %d", len(got.Errors))
 	}
 }
 
@@ -227,6 +258,7 @@ func TestLRUCacheResourceVersionInvalidation(t *testing.T) {
 Tests to write:
 - `TestValidatePolicyCacheHit` - Second call to ValidatePolicy returns cached result without calling cosign
 - `TestValidatePolicyCacheSkipsErrors` - Failed validation is NOT cached, second call invokes cosign again
+- `TestValidatePolicyCachePartialSuccess` - Multi-authority CIP where one passes and one fails: result IS cached, cosign not invoked on second call
 - `TestValidatePolicyNoCacheDefault` - When no cache is injected (default), every call invokes cosign (NoCache fallback)
 
 ```go
@@ -344,6 +376,73 @@ func TestValidatePolicyCacheSkipsErrors(t *testing.T) {
 	}
 }
 
+func TestValidatePolicyCachePartialSuccess(t *testing.T) {
+	// Multi-authority CIP: one authority fails (cosign), one passes (static).
+	// ValidatePolicy returns non-nil PolicyResult AND non-empty errors.
+	// This partial success SHOULD be cached.
+	origCVS := cosignVerifySignatures
+	defer func() { cosignVerifySignatures = origCVS }()
+
+	callCount := 0
+	cosignVerifySignatures = func(_ context.Context, _ name.Reference, _ *cosign.CheckOpts) ([]oci.Signature, bool, error) {
+		callCount++
+		return nil, false, errors.New("signature invalid")
+	}
+
+	ctx, _ := rtesting.SetupFakeContext(t)
+	kc, err := k8schain.NewNoClient(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache := NewLRUCache(10, 1*time.Hour)
+	ctx = ToContext(ctx, cache)
+
+	cip := webhookcip.ClusterImagePolicy{
+		Authorities: []webhookcip.Authority{
+			{
+				// This authority will fail (cosign mock returns error)
+				Key: &webhookcip.KeyRef{
+					Data:              authorityKeyCosignPubString,
+					PublicKeys:        []crypto.PublicKey{authorityKeyCosignPub},
+					HashAlgorithm:     signaturealgo.DefaultSignatureAlgorithm,
+					HashAlgorithmCode: crypto.SHA256,
+				},
+			},
+			{
+				// This authority will pass (static action)
+				Static: &webhookcip.Static{Action: "pass"},
+			},
+		},
+	}
+	cip.UID = "test-uid"
+	cip.ResourceVersion = "v1"
+
+	// First call - one authority fails, one passes -> partial success
+	result1, errs1 := ValidatePolicy(ctx, system.Namespace(), digest, cip, kc)
+	if result1 == nil {
+		t.Fatal("expected non-nil PolicyResult (partial success)")
+	}
+	if len(errs1) == 0 {
+		t.Fatal("expected errors from the failing authority")
+	}
+	if callCount != 1 {
+		t.Fatalf("expected cosign to be called once, got %d", callCount)
+	}
+
+	// Second call - should return cached result, cosign NOT called again
+	result2, errs2 := ValidatePolicy(ctx, system.Namespace(), digest, cip, kc)
+	if result2 == nil {
+		t.Fatal("expected non-nil cached PolicyResult")
+	}
+	if len(errs2) == 0 {
+		t.Fatal("expected cached errors from the failing authority")
+	}
+	if callCount != 1 {
+		t.Fatalf("expected cosign NOT to be called again (cache hit), got %d calls", callCount)
+	}
+}
+
 func TestValidatePolicyNoCacheDefault(t *testing.T) {
 	origCVS := cosignVerifySignatures
 	defer func() { cosignVerifySignatures = origCVS }()
@@ -432,7 +531,8 @@ import (
 )
 
 // LRUCache implements ResultCache using an LRU cache with TTL expiration.
-// Errors are not cached - only successful validation results are stored.
+// Only successful validations (PolicyResult non-nil) are cached.
+// Failed validations (PolicyResult nil) are not cached to allow retries.
 type LRUCache struct {
 	cache *expirable.LRU[string, *CacheResult]
 }
@@ -457,9 +557,13 @@ func (c *LRUCache) Get(ctx context.Context, image, uid, resourceVersion string) 
 }
 
 func (c *LRUCache) Set(ctx context.Context, image, name, uid, resourceVersion string, cacheResult *CacheResult) {
-	// Do not cache errors - they are transient and caching them risks
-	// confusing users who are actively signing images.
-	if len(cacheResult.Errors) > 0 {
+	// Only cache successful validations where PolicyResult is non-nil
+	// (at least one authority matched). Failed validations (PolicyResult nil)
+	// are not cached - they are transient and caching them risks confusing
+	// users who are actively signing images.
+	// Note: a successful result may still have Errors from authorities that
+	// didn't match, as long as at least one authority passed (validator.go:585-641).
+	if cacheResult.PolicyResult == nil {
 		return
 	}
 	c.cache.Add(cacheKeyFor(image, uid, resourceVersion), cacheResult)
@@ -471,9 +575,13 @@ func (c *LRUCache) Set(ctx context.Context, image, name, uid, resourceVersion st
 **Change**: `ref.Name()` -> `ref.String()` (already in working tree)
 
 #### 3. Add Direct Dependency
-**Command**: `go get github.com/hashicorp/golang-lru/v2@v2.0.7`
+**Commands**:
+```bash
+go get github.com/hashicorp/golang-lru/v2@v2.0.7
+go mod tidy
+```
 
-This promotes the indirect dependency to a direct one in `go.mod`.
+This promotes the indirect v2 dependency to a direct one in `go.mod`. The `go mod tidy` cleans up the dependency graph — `golang-lru v1.0.2` (currently listed as direct but not imported anywhere in Go source) may be demoted to indirect or removed.
 
 ### Success Criteria:
 
@@ -562,7 +670,8 @@ func NewValidatingAdmissionController(ctx context.Context, cmw configmap.Watcher
 ### Unit Tests (`pkg/webhook/lrucache_test.go`):
 - Basic Set/Get round-trip
 - Cache miss on empty cache
-- Error results are not cached
+- Failed validations (PolicyResult nil) are not cached
+- Partial success (PolicyResult non-nil with errors) IS cached
 - TTL expiry evicts entries
 - LRU eviction when cache is full
 - Key isolation (different image/uid/version don't collide)
@@ -571,6 +680,7 @@ func NewValidatingAdmissionController(ctx context.Context, cmw configmap.Watcher
 ### Integration Tests (`pkg/webhook/validator_test.go`):
 - `ValidatePolicy` cache hit: second call returns cached result, cosign not invoked again
 - `ValidatePolicy` error bypass: failed validation not cached, cosign invoked on retry
+- `ValidatePolicy` partial success: multi-authority CIP where one passes and one fails, result is cached
 - `ValidatePolicy` no cache default: when no cache is injected, every call invokes cosign (NoCache fallback, backwards compatibility)
 
 ### Existing E2E Tests:
